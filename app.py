@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import io
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 
 st.title("📈 Forex Hedging Strategy Backtester")
-st.caption("Symulator strategii z Dźwignią 1:500, limitem lota oraz prowizją od transakcji")
+st.caption("Symulator strategii z ciągłym testem na Wielu Plikach naraz, Dźwignią 1:500 i limitem lota")
 
 FOREX_PAIRS = [
     "USDJPY", "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "AUDCAD", 
@@ -16,59 +17,71 @@ FOREX_PAIRS = [
     "GBPNZD", "NZDCAD", "NZDJPY"
 ]
 
-# --- TRWAŁE BUFOROWANIE DANYCH TICKOWYCH ---
+# --- TRWAŁE BUFOROWANIE I ŁĄCZENIE PLIKÓW ---
 @st.cache_data(show_spinner=False)
-def load_and_parse_ticks(file_bytes, filename, custom_spread_pips, use_custom, pip_sz):
-    try:
-        import io
-        uploaded_file = io.BytesIO(file_bytes)
-        sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
-        uploaded_file.seek(0)
-        sep = ';' if ';' in sample else (',' if ',' in sample else '\t')
-        
-        df = pd.read_csv(uploaded_file, sep=sep, header=None, engine='python')
-        
-        if len(df.columns) >= 3 and isinstance(df.iloc[0, 1], (int, float, np.number)):
-            df = df.rename(columns={0: 'Timestamp', 1: 'Bid', 2: 'Ask'})
-        elif len(df.columns) >= 2 and isinstance(df.iloc[0, 1], (int, float, np.number)):
-            df = df.rename(columns={0: 'Timestamp', 1: 'Bid'})
-            df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
-        else:
+def load_and_combine_ticks(files_dict_sorted, custom_spread_pips, use_custom, pip_sz):
+    dfs = []
+    for filename, file_bytes in files_dict_sorted.items():
+        try:
+            uploaded_file = io.BytesIO(file_bytes)
+            sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
             uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, sep=sep, engine='python')
-            col_map = {}
-            for c in df.columns:
-                cl = str(c).lower()
-                if 'bid' in cl or 'close' in cl or 'price' in cl:
-                    col_map[c] = 'Bid'
-                elif 'ask' in cl:
-                    col_map[c] = 'Ask'
-                elif 'date' in cl or 'time' in cl:
-                    col_map[c] = 'Timestamp'
-            df = df.rename(columns=col_map)
-
-        if use_custom or 'Ask' not in df.columns:
-            df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
+            sep = ';' if ';' in sample else (',' if ',' in sample else '\t')
             
-        return df[['Timestamp', 'Bid', 'Ask']].dropna()
-    except Exception as e:
-        return None
+            df = pd.read_csv(uploaded_file, sep=sep, header=None, engine='python')
+            
+            if len(df.columns) >= 3 and isinstance(df.iloc[0, 1], (int, float, np.number)):
+                df = df.rename(columns={0: 'Timestamp', 1: 'Bid', 2: 'Ask'})
+            elif len(df.columns) >= 2 and isinstance(df.iloc[0, 1], (int, float, np.number)):
+                df = df.rename(columns={0: 'Timestamp', 1: 'Bid'})
+                df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
+            else:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, sep=sep, engine='python')
+                col_map = {}
+                for c in df.columns:
+                    cl = str(c).lower()
+                    if 'bid' in cl or 'close' in cl or 'price' in cl:
+                        col_map[c] = 'Bid'
+                    elif 'ask' in cl:
+                        col_map[c] = 'Ask'
+                    elif 'date' in cl or 'time' in cl:
+                        col_map[c] = 'Timestamp'
+                df = df.rename(columns=col_map)
+
+            if use_custom or 'Ask' not in df.columns:
+                df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
+                
+            dfs.append(df[['Timestamp', 'Bid', 'Ask']].dropna())
+        except Exception as e:
+            continue
+            
+    if dfs:
+        combined_df = pd.concat(dfs, ignore_index=True)
+        return combined_df
+    return None
 
 # --- PANEL BOCZNY ---
 st.sidebar.header("⚙️ Ustawienia Konta & Dźwigni")
 
-uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV/DAT z tickami", type=["csv", "txt", "dat"])
+uploaded_files = st.sidebar.file_uploader(
+    "📁 Wgraj plik(i) CSV/DAT z tickami", 
+    type=["csv", "txt", "dat"], 
+    accept_multiple_files=True
+)
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    st.session_state['file_bytes'] = file_bytes
-    st.session_state['filename'] = uploaded_file.name
+if 'files_dict' not in st.session_state:
+    st.session_state['files_dict'] = {}
+
+if uploaded_files:
+    for f in uploaded_files:
+        st.session_state['files_dict'][f.name] = f.getvalue()
 
 detected_pair = "USDJPY"
-if 'filename' in st.session_state:
-    current_name = st.session_state['filename'].upper()
+if st.session_state['files_dict']:
+    first_name = list(st.session_state['files_dict'].keys())[0].upper()
     for pair in FOREX_PAIRS:
-        if pair in current_name:
+        if pair in first_name:
             detected_pair = pair
             break
 
@@ -82,8 +95,7 @@ capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, ste
 leverage = st.sidebar.selectbox("Dźwignia (Leverage)", [500, 200, 100, 30, 10], index=0)
 base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
 
-# --- NOWE POLA ---
-max_lot_cap = st.sidebar.number_input("🛡️ Maksymalny limit lota (np. 0.32 lub 0.64)", value=0.64, step=0.08, format="%.2f")
+max_lot_cap = st.sidebar.number_input("🛡️ Maksymalny limit lota (dowolna wartość)", value=0.64, step=0.08, format="%.2f")
 commission_per_lot = st.sidebar.number_input("💸 Prowizja / Opłata ($ na 1.0 lot)", value=7.00, step=0.50, format="%.2f")
 
 tp_pips = st.sidebar.number_input("Take Profit (pips)", value=30.0, step=1.0)
@@ -246,30 +258,35 @@ def run_backtest(df, initial_capital, base_lot, max_lot_cap_val, comm_per_lot, t
     return pd.DataFrame(trades_history), equity_curve, stop_out_occurred, max_lot_used, total_commission_paid
 
 # --- INTERFEJS GŁÓWNY ---
-if 'file_bytes' in st.session_state:
-    df = load_and_parse_ticks(
-        st.session_state['file_bytes'], 
-        st.session_state['filename'], 
-        custom_spread_pips, 
-        use_custom_spread, 
-        pip_size
-    )
+if st.session_state['files_dict']:
+    # Sortujemy pliki według nazw (zwykle daty w nazwie układają je chronologicznie)
+    sorted_files = dict(sorted(st.session_state['files_dict'].items()))
+    
+    with st.spinner("Łączenie i przygotowywanie danych ze wszystkich plików..."):
+        df = load_and_combine_ticks(
+            sorted_files, 
+            custom_spread_pips, 
+            use_custom_spread, 
+            pip_size
+        )
     
     if df is not None and len(df) > 0:
-        st.success(f"DANE ZAPAMIĘTANE W PAMIĘCI! Plik: **{st.session_state['filename']}** | Ticków: **{len(df):,}**")
+        file_count = len(sorted_files)
+        st.success(f"POŁĄCZONO {file_count} PLIKÓW! Łączna liczba ticków: **{len(df):,}**")
+        st.write("Wgrane pliki w kolejności testowania:", ", ".join(f"`{name}`" for name in sorted_files.keys()))
         
         estimated_profit = tp_pips * (pip_value_per_lot * base_lot)
         dep_base = margin_per_lot * base_lot
         
         st.info(f"📊 **Aktualne ustawienia cTrader ({selected_pair}):** Depozyt ({base_lot:.2f} lot) = **${dep_base:.2f}** | Zysk TP ({tp_pips:.1f} pips) = **${estimated_profit:.2f}** | Limit Lota = **{max_lot_cap:.2f}** | Opłata = **${commission_per_lot:.2f}/lot**")
         
-        if st.button("🚀 Uruchom Symulację"):
-            with st.spinner("Przetwarzanie danych..."):
+        if st.button("🚀 Uruchom Symulację dla Wszystkich Plików"):
+            with st.spinner(f"Symulacja w toku na {len(df):,} tickach..."):
                 trades_df, equity_curve, stop_out, max_lot, total_comm = run_backtest(
                     df, capital, base_lot, max_lot_cap, commission_per_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
                 )
             
-            st.subheader("📊 Wyniki Strategii")
+            st.subheader("📊 Wyniki Strategii ze Wszystkich Plików")
             
             if stop_out:
                 st.error("⚠️ NASTĄPIŁ STOP OUT (BANKRUTWO KONTA)! Seria podwojeń przekroczyła wolny depozyt.")
@@ -284,16 +301,16 @@ if 'file_bytes' in st.session_state:
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Końcowy Kapitał", f"${final_balance:,.2f}")
             col2.metric("Zysk / Strata", f"${total_profit:,.2f}", f"{roi:.2f}%")
-            col3.metric("Pobranie Prowizje", f"${total_comm:,.2f}")
+            col3.metric("Pobrane Prowizje", f"${total_comm:,.2f}")
             col4.metric("TP / SL (Liczba)", f"{tp_count} / {sl_count}")
             col5.metric("Największa Transakcja", f"{max_lot:.2f} lot")
             
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=equity_curve, mode='lines', name='Equity/Balance', line=dict(color='#00FF7F', width=2)))
-            fig.update_layout(title=f"Krzywa Kapitału ({selected_pair} | Max Lot: {max_lot_cap})", xaxis_title="Zamknięcia transakcji", yaxis_title="Saldo ($)", template="plotly_dark")
+            fig.update_layout(title=f"Krzywa Kapitału z Połączonych Plików ({selected_pair} | Max Lot: {max_lot_cap})", xaxis_title="Zamknięcia transakcji", yaxis_title="Saldo ($)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("📋 Dziennik Zamkniętych Transakcji")
+            st.subheader("📋 Pelny Dziennik Transakcji")
             st.dataframe(trades_df, use_container_width=True)
 else:
-    st.info("👈 Wgraj plik CSV z tickami z panelu po lewej stronie, aby rozpocząć symulację.")
+    st.info("👈 Wgraj pliki CSV z tickami w panelu po lewej stronie, aby rozpocząć symulację.")
