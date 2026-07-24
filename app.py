@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import re
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
@@ -10,7 +9,6 @@ st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 st.title("📈 Forex Hedging Strategy Backtester")
 st.caption("Symulator strategii hedgingowej z progresją na danych tickowych")
 
-# --- LISTA PAR WALUTOWYCH Z CTRADER ---
 FOREX_PAIRS = [
     "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "USDJPY", "AUDCAD", 
     "AUDCHF", "AUDJPY", "CADJPY", "EURAUD", "CHFJPY", "EURCAD", 
@@ -18,11 +16,10 @@ FOREX_PAIRS = [
     "GBPNZD", "NZDCAD", "NZDJPY"
 ]
 
-# --- PANEL BOCZNY / PARAMETRY WEJŚCIOWE ---
+# --- PANEL BOCZNY ---
 st.sidebar.header("⚙️ Parametry Strategii")
 
-# Auto-wykrywanie z nazwy pliku lub ręczny wybór pary
-uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV z tickami", type=["csv", "txt"])
+uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV/DAT z tickami", type=["csv", "txt", "dat"])
 
 detected_pair = "EURUSD"
 if uploaded_file is not None:
@@ -34,10 +31,9 @@ if uploaded_file is not None:
 
 selected_pair = st.sidebar.selectbox("💱 Wybrana para walutowa", FOREX_PAIRS, index=FOREX_PAIRS.index(detected_pair))
 
-# Automatyczne ustawienie pipsa na podstawie pary JPY vs non-JPY
 is_jpy = "JPY" in selected_pair
 default_pip_size = 0.01 if is_jpy else 0.0001
-default_pip_val = 6.50 if is_jpy else 10.00  # Szacunkowa wartość 1 pipsa dla 1.0 lota w USD
+default_pip_val = 6.50 if is_jpy else 10.00
 
 capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, step=500.0)
 base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
@@ -46,9 +42,53 @@ sl_pips = st.sidebar.number_input("Stop Loss (pips)", value=20.0, step=1.0)
 multiplier = st.sidebar.number_input("Mnożnik progresji", value=2.0, step=0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("🔧 Automatyczne ustawienia wymiaru pipsa")
+st.sidebar.subheader("📐 Ustawienia Spreadu & Pipsa")
+use_custom_spread = st.sidebar.checkbox("Użyj własnego spreadu z cTrader (np. 0.2 pipsa)", value=False)
+custom_spread_pips = st.sidebar.number_input("Własny spread (pips)", value=0.2, step=0.1, format="%.2f")
+
 pip_size = st.sidebar.number_input("Wielkość pipsa", value=default_pip_size, format="%.4f" if is_jpy else "%.5f")
 pip_value_per_lot = st.sidebar.number_input("Wartość 1 pipsa / 1 lot ($)", value=default_pip_val, step=0.5)
+
+# --- FUNKCJA PARSUJĄCA PLIKI HISTDATA / CSV ---
+def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
+    try:
+        # Odczytujemy pierwsze linie, żeby sprawdzić separator i format
+        sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
+        uploaded_file.seek(0)
+        
+        sep = ';' if ';' in sample else (',' if ',' in sample else '\t')
+        
+        df = pd.read_csv(uploaded_file, sep=sep, header=None, engine='python')
+        
+        # Format HistData ASCII: [DateTime, Bid, Ask, Volume] lub [DateTime, Bid, Ask]
+        if len(df.columns) >= 3 and isinstance(df.iloc[0, 1], (int, float, np.number)):
+            df = df.rename(columns={0: 'Timestamp', 1: 'Bid', 2: 'Ask'})
+        elif len(df.columns) >= 2 and isinstance(df.iloc[0, 1], (int, float, np.number)):
+            df = df.rename(columns={0: 'Timestamp', 1: 'Bid'})
+            df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
+        else:
+            # Re-read z nagłówkami
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, sep=sep, engine='python')
+            col_map = {}
+            for c in df.columns:
+                cl = str(c).lower()
+                if 'bid' in cl or 'close' in cl or 'price' in cl:
+                    col_map[c] = 'Bid'
+                elif 'ask' in cl:
+                    col_map[c] = 'Ask'
+                elif 'date' in cl or 'time' in cl:
+                    col_map[c] = 'Timestamp'
+            df = df.rename(columns=col_map)
+
+        # Jeśli zaznaczono własny spread z cTradera
+        if use_custom or 'Ask' not in df.columns:
+            df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
+            
+        return df[['Timestamp', 'Bid', 'Ask']].dropna()
+    except Exception as e:
+        st.error(f"Błąd odczytu danych: {e}")
+        return None
 
 # --- SILNIK SYMULACJI ---
 def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pip_val, pip_sz):
@@ -63,16 +103,17 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
     sell_lots = base_lot
     
     current_bid = df['Bid'].iloc[0]
+    current_ask = df['Ask'].iloc[0]
     
     positions = [
-        {'type': 'BUY', 'lot': buy_lots, 'open': current_bid, 'tp': current_bid + tp_dist, 'sl': current_bid - sl_dist},
+        {'type': 'BUY', 'lot': buy_lots, 'open': current_ask, 'tp': current_ask + tp_dist, 'sl': current_ask - sl_dist},
         {'type': 'SELL', 'lot': sell_lots, 'open': current_bid, 'tp': current_bid - tp_dist, 'sl': current_bid + sl_dist}
     ]
     
     for idx, row in df.iterrows():
         bid = row['Bid']
-        ask = row.get('Ask', bid)
-        timestamp = row.get('Timestamp', idx)
+        ask = row['Ask']
+        timestamp = row['Timestamp']
         
         closed_this_tick = []
         
@@ -148,52 +189,24 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
                         buy_lots += closed_lot * multiplier
 
             positions = [
-                {'type': 'BUY', 'lot': buy_lots, 'open': bid, 'tp': bid + tp_dist, 'sl': bid - sl_dist},
+                {'type': 'BUY', 'lot': buy_lots, 'open': ask, 'tp': ask + tp_dist, 'sl': ask - sl_dist},
                 {'type': 'SELL', 'lot': sell_lots, 'open': bid, 'tp': bid - tp_dist, 'sl': bid + sl_dist}
             ]
 
     return pd.DataFrame(trades_history), equity_curve
 
-# --- FUNKCJA PARSUJĄCA ELASTYCZNIE PLIK CSV ---
-def parse_csv_file(uploaded_file):
-    try:
-        df = pd.read_csv(uploaded_file, sep=None, engine='python', nrows=100)
-        uploaded_file.seek(0)
-        
-        # Sprawdzanie braku nagłówków
-        if not any(isinstance(col, str) and any(kw in str(col).lower() for kw in ['bid', 'ask', 'price', 'close', 'date', 'time']) for col in df.columns):
-            df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None)
-            num_cols = df.select_dtypes(include=[np.number]).columns
-            if len(num_cols) >= 1:
-                df = df.rename(columns={num_cols[0]: 'Bid'})
-                if len(num_cols) >= 2:
-                    df = df.rename(columns={num_cols[1]: 'Ask'})
-        else:
-            df = pd.read_csv(uploaded_file, sep=None, engine='python')
-            col_map = {}
-            for col in df.columns:
-                col_lower = str(col).lower()
-                if 'bid' in col_lower or 'price' in col_lower or 'close' in col_lower:
-                    col_map[col] = 'Bid'
-                elif 'ask' in col_lower:
-                    col_map[col] = 'Ask'
-                elif 'date' in col_lower or 'time' in col_lower or 'timestamp' in col_lower:
-                    col_map[col] = 'Timestamp'
-            df = df.rename(columns=col_map)
-            
-        return df
-    except Exception as e:
-        st.error(f"Błąd odczytu pliku CSV: {e}")
-        return None
-
 # --- INTERFEJS GŁÓWNY ---
 if uploaded_file is not None:
-    st.success(f"Plik CSV załadowany! Wykryta/wybrana para: **{selected_pair}**")
-    df = parse_csv_file(uploaded_file)
+    df = parse_tick_file(uploaded_file, custom_spread_pips, use_custom_spread, pip_size)
     
-    if df is not None and 'Bid' in df.columns:
-        st.write(f"Liczba załadowanych wierszy: **{len(df):,}**")
-        st.write("Podgląd początkowych ticków:")
+    if df is not None and len(df) > 0:
+        st.success(f"Plik załadowany! Para: **{selected_pair}** | Załadowanych ticków: **{len(df):,}**")
+        
+        # Wyliczenie aktualnego spreadu z pliku
+        sample_spread = (df['Ask'].iloc[0] - df['Bid'].iloc[0]) / pip_size
+        st.info(f"💡 Aktualny spread w teście: **{sample_spread:.2f} pipsa** (Bid: {df['Bid'].iloc[0]}, Ask: {df['Ask'].iloc[0]})")
+        
+        st.write("Podgląd pierwszych 3 wierszy:")
         st.dataframe(df.head(3), use_container_width=True)
         
         if st.button("🚀 Uruchom Symulację"):
@@ -220,7 +233,5 @@ if uploaded_file is not None:
             
             st.subheader("📋 Dziennik Transakcji")
             st.dataframe(trades_df.style.highlight_max(axis=0, color='#1e3d2f'), use_container_width=True)
-    else:
-        st.error("Nie udało się odczytać kolumny cenowej ('Bid'). Sprawdź strukturę pliku.")
 else:
     st.info("👈 Wgraj plik CSV z tickami z panelu po lewej stronie, aby rozpocząć symulację.")
