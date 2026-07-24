@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 
 st.title("📈 Forex Hedging Strategy Backtester")
-st.caption("Symulator strategii z uwzględnieniem Dźwigni 1:500, Depozytu Zabezpieczającego i Stop Out")
+st.caption("Symulator strategii z Dźwignią 1:500 i trwałym zapisem pliku w pamięci")
 
 FOREX_PAIRS = [
     "USDJPY", "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "AUDCAD", 
@@ -16,53 +16,12 @@ FOREX_PAIRS = [
     "GBPNZD", "NZDCAD", "NZDJPY"
 ]
 
-# --- OBSŁUGA MEMORY SESJI ---
-if 'df_ticks' not in st.session_state:
-    st.session_state['df_ticks'] = None
-if 'file_name' not in st.session_state:
-    st.session_state['file_name'] = ""
-
-# --- PANEL BOCZNY ---
-st.sidebar.header("⚙️ Ustawienia Konta & Dźwigni")
-
-uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV/DAT z tickami", type=["csv", "txt", "dat"])
-
-if uploaded_file is not None and uploaded_file.name != st.session_state['file_name']:
-    st.session_state['file_name'] = uploaded_file.name
-    st.session_state['df_ticks'] = None
-
-detected_pair = "USDJPY"
-current_name = st.session_state['file_name'].upper()
-for pair in FOREX_PAIRS:
-    if pair in current_name:
-        detected_pair = pair
-        break
-
-selected_pair = st.sidebar.selectbox("💱 Wybrana para walutowa", FOREX_PAIRS, index=FOREX_PAIRS.index(detected_pair))
-
-is_jpy = "JPY" in selected_pair
-default_pip_size = 0.01 if is_jpy else 0.0001
-default_pip_val = 6.11 if is_jpy else 10.00  # Dokładna wartość pipsa dla USDJPY przy ~163.70 z cTradera
-
-capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, step=500.0)
-leverage = st.sidebar.selectbox("Dźwignia (Leverage)", [500, 200, 100, 30, 10], index=0)
-base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
-tp_pips = st.sidebar.number_input("Take Profit (pips)", value=25.0, step=1.0)
-sl_pips = st.sidebar.number_input("Stop Loss (pips)", value=20.0, step=1.0)
-multiplier = st.sidebar.number_input("Mnożnik progresji", value=2.0, step=0.5)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📐 Ustawienia Rynkowe z cTrader")
-use_custom_spread = st.sidebar.checkbox("Użyj własnego spreadu z cTrader (np. 0.1 pipsa)", value=True)
-custom_spread_pips = st.sidebar.number_input("Własny spread (pips)", value=0.1, step=0.1, format="%.2f")
-
-pip_size = st.sidebar.number_input("Wielkość 1 pipsa", value=default_pip_size, format="%.4f" if is_jpy else "%.5f")
-pip_value_per_lot = st.sidebar.number_input("Wartość 1 pipsa / 1 lot ($)", value=default_pip_val, step=0.1)
-margin_per_lot = st.sidebar.number_input("Wymagany depozyt dla 1.0 lota ($)", value=200.0, step=10.0)  # $2 dla 0.01 przy 1:500
-
-# --- FUNKCJA PARSUJĄCA PLIK ---
-def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
+# --- TRWAŁE BUFOROWANIE DANYCH TICKOWYCH ---
+@st.cache_data(show_spinner=False)
+def load_and_parse_ticks(file_bytes, filename, custom_spread_pips, use_custom, pip_sz):
     try:
+        import io
+        uploaded_file = io.BytesIO(file_bytes)
         sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
         uploaded_file.seek(0)
         sep = ';' if ';' in sample else (',' if ',' in sample else '\t')
@@ -93,14 +52,50 @@ def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
             
         return df[['Timestamp', 'Bid', 'Ask']].dropna()
     except Exception as e:
-        st.error(f"Błąd odczytu danych: {e}")
         return None
 
-if uploaded_file is not None and st.session_state['df_ticks'] is None:
-    with st.spinner("Wczytywanie i przetwarzanie pliku..."):
-        st.session_state['df_ticks'] = parse_tick_file(uploaded_file, custom_spread_pips, use_custom_spread, pip_size)
+# --- PANEL BOCZNY ---
+st.sidebar.header("⚙️ Ustawienia Konta & Dźwigni")
 
-# --- SILNIK SYMULACJI Z DEPOZYTEM I STOP OUT ---
+uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV/DAT z tickami", type=["csv", "txt", "dat"])
+
+# Przechowywanie danych w sesji
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    st.session_state['file_bytes'] = file_bytes
+    st.session_state['filename'] = uploaded_file.name
+
+detected_pair = "USDJPY"
+if 'filename' in st.session_state:
+    current_name = st.session_state['filename'].upper()
+    for pair in FOREX_PAIRS:
+        if pair in current_name:
+            detected_pair = pair
+            break
+
+selected_pair = st.sidebar.selectbox("💱 Wybrana para walutowa", FOREX_PAIRS, index=FOREX_PAIRS.index(detected_pair))
+
+is_jpy = "JPY" in selected_pair
+default_pip_size = 0.01 if is_jpy else 0.0001
+default_pip_val = 6.11 if is_jpy else 10.00
+
+capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, step=500.0)
+leverage = st.sidebar.selectbox("Dźwignia (Leverage)", [500, 200, 100, 30, 10], index=0)
+base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
+tp_pips = st.sidebar.number_input("Take Profit (pips)", value=25.0, step=1.0)
+sl_pips = st.sidebar.number_input("Stop Loss (pips)", value=20.0, step=1.0)
+multiplier = st.sidebar.number_input("Mnożnik progresji", value=2.0, step=0.5)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📐 Ustawienia Rynkowe z cTrader")
+use_custom_spread = st.sidebar.checkbox("Użyj własnego spreadu z cTrader (np. 0.1 pipsa)", value=True)
+custom_spread_pips = st.sidebar.number_input("Własny spread (pips)", value=0.1, step=0.1, format="%.2f")
+
+pip_size = st.sidebar.number_input("Wielkość 1 pipsa", value=default_pip_size, format="%.4f" if is_jpy else "%.5f")
+pip_value_per_lot = st.sidebar.number_input("Wartość 1 pipsa / 1 lot ($)", value=default_pip_val, step=0.1)
+margin_per_lot = st.sidebar.number_input("Wymagany depozyt dla 1.0 lota ($)", value=200.0, step=10.0)
+
+# --- SILNIK SYMULACJI ---
 def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pip_val, pip_sz, margin_per_lot_val):
     tp_dist = tp_pips * pip_sz
     sl_dist = sl_pips * pip_sz
@@ -128,12 +123,10 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
         ask = row['Ask']
         timestamp = row['Timestamp']
         
-        # Obliczenie wymaganego depozytu
         total_open_lots = sum(p['lot'] for p in positions)
         required_margin = total_open_lots * margin_per_lot_val
         
-        # Kontrola Stop Out (brak środków pod depozyt)
-        if balance <= required_margin * 0.2:  # Stop Out przy 20% Margin Level
+        if balance <= required_margin * 0.2:
             stop_out_occurred = True
             trades_history.append({
                 'Timestamp': timestamp,
@@ -238,47 +231,53 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
     return pd.DataFrame(trades_history), equity_curve, stop_out_occurred
 
 # --- INTERFEJS GŁÓWNY ---
-df = st.session_state['df_ticks']
-
-if df is not None and len(df) > 0:
-    st.success(f"DANE ZAŁADOWANE! Para: **{selected_pair}** | Dźwignia: **1:{leverage}**")
+if 'file_bytes' in st.session_state:
+    df = load_and_parse_ticks(
+        st.session_state['file_bytes'], 
+        st.session_state['filename'], 
+        custom_spread_pips, 
+        use_custom_spread, 
+        pip_size
+    )
     
-    # Wyliczenie wartości pozycji w cTrader
-    estimated_profit_001 = 25.0 * (pip_value_per_lot * 0.01)
-    dep_001 = margin_per_lot * 0.01
-    
-    st.info(f"📊 Parametry z cTrader USDJPY: Depozyt dla 0.01 lota = **${dep_001:.2f}** | Zysk z TP (25 pips) dla 0.01 lota = **${estimated_profit_001:.2f}**")
-    
-    if st.button("🚀 Uruchom Symulację"):
-        with st.spinner("Przetwarzanie danych..."):
-            trades_df, equity_curve, stop_out = run_backtest(
-                df, capital, base_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
-            )
+    if df is not None and len(df) > 0:
+        st.success(f"DANE ZAPAMIĘTANE W PAMIĘCI! Plik: **{st.session_state['filename']}** | Ticków: **{len(df):,}**")
         
-        st.subheader("📊 Wyniki Strategii")
+        estimated_profit_001 = 25.0 * (pip_value_per_lot * 0.01)
+        dep_001 = margin_per_lot * 0.01
         
-        if stop_out:
-            st.error("⚠️ NASTĄPIŁ STOP OUT (BANKRUTWO KONTA)! Wystąpiła seria podwojeń przekraczająca depozyt zabezpieczający.")
+        st.info(f"📊 Parametry cTrader ({selected_pair}): Depozyt 0.01 lota = **${dep_001:.2f}** | Zysk z TP 25 pips = **${estimated_profit_001:.2f}**")
         
-        final_balance = equity_curve[-1]
-        total_profit = final_balance - capital
-        roi = (total_profit / capital) * 100
-        
-        tp_count = len(trades_df[trades_df['Reason'] == 'TP']) if not trades_df.empty else 0
-        sl_count = len(trades_df[trades_df['Reason'] == 'SL']) if not trades_df.empty else 0
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Końcowy Kapitał", f"${final_balance:,.2f}")
-        col2.metric("Zysk / Strata", f"${total_profit:,.2f}", f"{roi:.2f}%")
-        col3.metric("Liczba TP", tp_count)
-        col4.metric("Liczba SL", sl_count)
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(y=equity_curve, mode='lines', name='Equity/Balance', line=dict(color='#00FF7F', width=2)))
-        fig.update_layout(title=f"Krzywa Kapitału ({selected_pair} | 1:{leverage})", xaxis_title="Zamknięcia transakcji", yaxis_title="Saldo ($)", template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.subheader("📋 Dziennik Zamkniętych Transakcji")
-        st.dataframe(trades_df, use_container_width=True)
+        if st.button("🚀 Uruchom Symulację"):
+            with st.spinner("Przetwarzanie danych..."):
+                trades_df, equity_curve, stop_out = run_backtest(
+                    df, capital, base_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
+                )
+            
+            st.subheader("📊 Wyniki Strategii")
+            
+            if stop_out:
+                st.error("⚠️ NASTĄPIŁ STOP OUT (BANKRUTWO KONTA)! Seria podwojeń przekroczyła wolny depozyt.")
+            
+            final_balance = equity_curve[-1]
+            total_profit = final_balance - capital
+            roi = (total_profit / capital) * 100
+            
+            tp_count = len(trades_df[trades_df['Reason'] == 'TP']) if not trades_df.empty else 0
+            sl_count = len(trades_df[trades_df['Reason'] == 'SL']) if not trades_df.empty else 0
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Końcowy Kapitał", f"${final_balance:,.2f}")
+            col2.metric("Zysk / Strata", f"${total_profit:,.2f}", f"{roi:.2f}%")
+            col3.metric("Liczba TP", tp_count)
+            col4.metric("Liczba SL", sl_count)
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=equity_curve, mode='lines', name='Equity/Balance', line=dict(color='#00FF7F', width=2)))
+            fig.update_layout(title=f"Krzywa Kapitału ({selected_pair} | 1:{leverage})", xaxis_title="Zamknięcia transakcji", yaxis_title="Saldo ($)", template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.subheader("📋 Dziennik Zamkniętych Transakcji")
+            st.dataframe(trades_df, use_container_width=True)
 else:
     st.info("👈 Wgraj plik CSV z tickami z panelu po lewej stronie, aby rozpocząć symulację.")
