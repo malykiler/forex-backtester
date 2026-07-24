@@ -5,10 +5,10 @@ import plotly.graph_objects as go
 import io
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Forex Single-Flow Backtester", layout="wide")
+st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 
-st.title("📈 Forex Single-Flow Strategy Backtester")
-st.caption("Taktyka natychmiastowej reakcji: TP -> Ponowny BUY z resetem | SL -> Przejście w SELL z podwojeniem")
+st.title("📈 Forex Hedging Strategy Backtester")
+st.caption("Model Progresji Głównej z Przeciwstawną Pozycją Asekuracyjną (1x)")
 
 FOREX_PAIRS = [
     "USDJPY", "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "AUDCAD", 
@@ -17,7 +17,7 @@ FOREX_PAIRS = [
     "GBPNZD", "NZDCAD", "NZDJPY"
 ]
 
-# --- TRWAŁE BUFOROWANIE I ZMNIEJSZENIE ZUŻYCIA RAM ---
+# --- TRWAŁE BUFOROWANIE ---
 @st.cache_data(show_spinner=False)
 def load_and_combine_ticks(files_dict_sorted, custom_spread_pips, use_custom, pip_sz):
     dfs = []
@@ -95,7 +95,7 @@ default_pip_val = 6.11 if is_jpy else 10.00
 
 capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, step=500.0)
 leverage = st.sidebar.selectbox("Dźwignia (Leverage)", [500, 200, 100, 30, 10], index=0)
-initial_direction = st.sidebar.selectbox("Kierunek pierwszej pozycji", ["BUY", "SELL"], index=0)
+start_direction = st.sidebar.selectbox("Kierunek pierwszej pozycji głównej", ["BUY", "SELL"], index=0)
 base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
 
 max_lot_cap = st.sidebar.number_input("🛡️ Maksymalny limit lota", value=0.64, step=0.08, format="%.2f")
@@ -114,8 +114,8 @@ pip_size = st.sidebar.number_input("Wielkość 1 pipsa", value=default_pip_size,
 pip_value_per_lot = st.sidebar.number_input("Wartość 1 pipsa / 1 lot ($)", value=default_pip_val, step=0.1)
 margin_per_lot = st.sidebar.number_input("Wymagany depozyt dla 1.0 lota ($)", value=200.0, step=10.0)
 
-# --- SILNIK SYMULACJI DLA JEDNEJ CIĄGŁEJ POZYCJI ---
-def run_single_flow_backtest(df, initial_capital, start_dir, base_lot, max_lot_cap_val, comm_per_lot, tp_pips, sl_pips, multiplier, pip_val, pip_sz, margin_per_lot_val):
+# --- SILNIK SYMULACJI (HEDGED PROGRESSION) ---
+def run_hedged_backtest(df, initial_capital, start_dir, base_lot, max_lot_cap_val, comm_per_lot, tp_pips, sl_pips, multiplier, pip_val, pip_sz, margin_per_lot_val):
     tp_dist = tp_pips * pip_sz
     sl_dist = sl_pips * pip_sz
     
@@ -128,18 +128,28 @@ def run_single_flow_backtest(df, initial_capital, start_dir, base_lot, max_lot_c
     asks = df['Ask'].values
     timestamps = df['Timestamp'].values
     
-    current_type = start_dir
-    current_lot = base_lot
+    main_dir = start_dir
+    main_lot = base_lot
+    hedge_lot = base_lot
     
-    if current_type == 'BUY':
-        open_price = asks[0]
-        tp_price = open_price + tp_dist
-        sl_price = open_price - sl_dist
-    else:
-        open_price = bids[0]
-        tp_price = open_price - tp_dist
-        sl_price = open_price + sl_dist
+    # Inicjalizacja pierwszej pary pozycji
+    def create_pair(m_dir, m_lot, h_lot, ask_p, bid_p):
+        h_dir = 'SELL' if m_dir == 'BUY' else 'BUY'
         
+        m_open = ask_p if m_dir == 'BUY' else bid_p
+        m_tp = m_open + tp_dist if m_dir == 'BUY' else m_open - tp_dist
+        m_sl = m_open - sl_dist if m_dir == 'BUY' else m_open + sl_dist
+        
+        h_open = ask_p if h_dir == 'BUY' else bid_p
+        h_tp = h_open + tp_dist if h_dir == 'BUY' else h_open - tp_dist
+        h_sl = h_open - sl_dist if h_dir == 'BUY' else h_open + sl_dist
+        
+        return [
+            {'role': 'MAIN', 'type': m_dir, 'lot': m_lot, 'tp': m_tp, 'sl': m_sl},
+            {'role': 'HEDGE', 'type': h_dir, 'lot': h_lot, 'tp': h_tp, 'sl': h_sl}
+        ]
+
+    positions = create_pair(main_dir, main_lot, hedge_lot, asks[0], bids[0])
     stop_out_occurred = False
     max_lot_used = base_lot
     
@@ -148,13 +158,18 @@ def run_single_flow_backtest(df, initial_capital, start_dir, base_lot, max_lot_c
         ask = asks[i]
         timestamp = timestamps[i]
         
-        required_margin = current_lot * margin_per_lot_val
+        total_open_lots = sum(p['lot'] for p in positions)
+        if total_open_lots > max_lot_used:
+            max_lot_used = total_open_lots
+            
+        required_margin = total_open_lots * margin_per_lot_val
+        
         if balance <= required_margin * 0.2:
             stop_out_occurred = True
             trades_history.append({
                 'Timestamp': timestamp,
                 'Type': 'STOP OUT',
-                'Lot': current_lot,
+                'Lot': total_open_lots,
                 'Reason': 'BANKRUTWO',
                 'PnL Czysty ($)': -balance,
                 'Prowizja ($)': 0.0,
@@ -163,73 +178,72 @@ def run_single_flow_backtest(df, initial_capital, start_dir, base_lot, max_lot_c
             equity_curve.append(0.0)
             break
             
-        closed = False
-        reason = None
-        raw_pnl = 0.0
-        
-        if current_type == 'BUY':
-            if bid >= tp_price:
-                raw_pnl = tp_pips * pip_val * current_lot
-                closed = True
-                reason = 'TP'
-            elif bid <= sl_price:
-                raw_pnl = -sl_pips * pip_val * current_lot
-                closed = True
-                reason = 'SL'
-        elif current_type == 'SELL':
-            if ask <= tp_price:
-                raw_pnl = tp_pips * pip_val * current_lot
-                closed = True
-                reason = 'TP'
-            elif ask >= sl_price:
-                raw_pnl = -sl_pips * pip_val * current_lot
-                closed = True
-                reason = 'SL'
-                
-        if closed:
-            comm = current_lot * comm_per_lot
-            total_commission_paid += comm
-            net_pnl = raw_pnl - comm
-            balance += net_pnl
+        closed_this_tick = []
+        for pos in positions:
+            p_type = pos['type']
+            lot = pos['lot']
+            tp_p = pos['tp']
+            sl_p = pos['sl']
             
-            trades_history.append({
-                'Timestamp': timestamp,
-                'Type': current_type,
-                'Lot': current_lot,
-                'Reason': reason,
-                'PnL Czysty ($)': net_pnl,
-                'Prowizja ($)': comm,
-                'Balance': balance
-            })
+            raw_pnl = 0.0
+            closed = False
+            reason = None
+            
+            if p_type == 'BUY':
+                if bid >= tp_p:
+                    raw_pnl = tp_pips * pip_val * lot
+                    closed = True
+                    reason = 'TP'
+                elif bid <= sl_p:
+                    raw_pnl = -sl_pips * pip_val * lot
+                    closed = True
+                    reason = 'SL'
+            elif p_type == 'SELL':
+                if ask <= tp_p:
+                    raw_pnl = tp_pips * pip_val * lot
+                    closed = True
+                    reason = 'TP'
+                elif ask >= sl_p:
+                    raw_pnl = -sl_pips * pip_val * lot
+                    closed = True
+                    reason = 'SL'
+                    
+            if closed:
+                comm = lot * comm_per_lot
+                total_commission_paid += comm
+                net_pnl = raw_pnl - comm
+                balance += net_pnl
+                closed_this_tick.append({'pos': pos, 'reason': reason, 'pnl': net_pnl})
+                trades_history.append({
+                    'Timestamp': timestamp,
+                    'Type': f"{pos['role']} ({p_type})",
+                    'Lot': lot,
+                    'Reason': reason,
+                    'PnL Czysty ($)': net_pnl,
+                    'Prowizja ($)': comm,
+                    'Balance': balance
+                })
+        
+        if closed_this_tick:
             equity_curve.append(balance)
             
-            # LOGIKA NOWEJ TAKTYKI
-            if reason == 'TP':
-                # Wygrana: zostajemy na BUY i resetujemy lota
-                current_type = 'BUY'
-                current_lot = base_lot
-                open_price = ask
-                tp_price = open_price + tp_dist
-                sl_price = open_price - sl_dist
-            elif reason == 'SL':
-                # Przegrana: zmieniamy kierunek na SELL i podwajamy lota (do limitu)
-                if current_type == 'BUY':
-                    current_type = 'SELL'
-                else:
-                    current_type = 'BUY'
-                    
-                current_lot = min(current_lot * multiplier, max_lot_cap_val)
-                if current_lot > max_lot_used:
-                    max_lot_used = current_lot
-                    
-                if current_type == 'BUY':
-                    open_price = ask
-                    tp_price = open_price + tp_dist
-                    sl_price = open_price - sl_dist
-                else:
-                    open_price = bid
-                    tp_price = open_price - tp_dist
-                    sl_price = open_price + sl_dist
+            # Gdy pozycja główna uderza w SL lub TP
+            main_closed = [item for item in closed_this_tick if item['pos']['role'] == 'MAIN']
+            
+            if main_closed:
+                item = main_closed[0]
+                reason = item['reason']
+                
+                if reason == 'TP':
+                    # Wygrana pozycji głównej -> Reset lota i powrót do startu
+                    main_lot = base_lot
+                    main_dir = start_dir
+                elif reason == 'SL':
+                    # Przegrana pozycji głównej -> Zmiana kierunku i podwojenie
+                    main_dir = 'SELL' if main_dir == 'BUY' else 'BUY'
+                    main_lot = min(main_lot * multiplier, max_lot_cap_val)
+                
+                positions = create_pair(main_dir, main_lot, base_lot, ask, bid)
 
     return pd.DataFrame(trades_history), equity_curve, stop_out_occurred, max_lot_used, total_commission_paid
 
@@ -252,12 +266,12 @@ if st.session_state['files_dict']:
         estimated_profit = tp_pips * (pip_value_per_lot * base_lot)
         dep_base = margin_per_lot * base_lot
         
-        st.info(f"📊 **Nowa Taktyka ({selected_pair}):** Depozyt ({base_lot:.2f} lot) = **${dep_base:.2f}** | Zysk TP ({tp_pips:.1f} pips) = **${estimated_profit:.2f}** | Limit Lota = **{max_lot_cap:.2f}**")
+        st.info(f"📊 **Hedging Progresywny ({selected_pair}):** Depozyt ({base_lot:.2f} lot) = **${dep_base:.2f}** | Zysk TP ({tp_pips:.1f} pips) = **${estimated_profit:.2f}** | Limit Lota = **{max_lot_cap:.2f}**")
         
-        if st.button("🚀 Uruchom Symulację Nowej Taktyki"):
+        if st.button("🚀 Uruchom Symulację"):
             with st.spinner(f"Symulacja w toku na {len(df):,} tickach..."):
-                trades_df, equity_curve, stop_out, max_lot, total_comm = run_single_flow_backtest(
-                    df, capital, initial_direction, base_lot, max_lot_cap, commission_per_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
+                trades_df, equity_curve, stop_out, max_lot, total_comm = run_hedged_backtest(
+                    df, capital, start_direction, base_lot, max_lot_cap, commission_per_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
                 )
             
             st.subheader("📊 Wyniki Strategii ze Wszystkich Plików")
@@ -290,7 +304,7 @@ if st.session_state['files_dict']:
             fig.update_layout(title=f"Krzywa Kapitału ({selected_pair} | Max Lot: {max_lot_cap})", xaxis_title="Zamknięcia transakcji", yaxis_title="Saldo ($)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("📋 Pełny Dziennik Transakcji")
+            st.subheader("📋 Pelny Dziennik Transakcji")
             st.dataframe(trades_df, use_container_width=True)
 else:
     st.info("👈 Wgraj pliki CSV z tickami w panelu po lewej stronie, aby rozpocząć symulację.")
