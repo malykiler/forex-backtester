@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 
 st.title("📈 Forex Hedging Strategy Backtester")
-st.caption("Symulator strategii z Dźwignią 1:500 i trwałym zapisem pliku w pamięci")
+st.caption("Symulator strategii z Dźwignią 1:500 i dynamicznym podglądem parametrów")
 
 FOREX_PAIRS = [
     "USDJPY", "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "AUDCAD", 
@@ -59,7 +59,6 @@ st.sidebar.header("⚙️ Ustawienia Konta & Dźwigni")
 
 uploaded_file = st.sidebar.file_uploader("📁 Wgraj plik CSV/DAT z tickami", type=["csv", "txt", "dat"])
 
-# Przechowywanie danych w sesji
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
     st.session_state['file_bytes'] = file_bytes
@@ -82,8 +81,8 @@ default_pip_val = 6.11 if is_jpy else 10.00
 capital = st.sidebar.number_input("Kapitał początkowy ($)", value=10000.0, step=500.0)
 leverage = st.sidebar.selectbox("Dźwignia (Leverage)", [500, 200, 100, 30, 10], index=0)
 base_lot = st.sidebar.number_input("Bazowa wielkość lota (1x)", value=0.01, step=0.01, format="%.2f")
-tp_pips = st.sidebar.number_input("Take Profit (pips)", value=25.0, step=1.0)
-sl_pips = st.sidebar.number_input("Stop Loss (pips)", value=20.0, step=1.0)
+tp_pips = st.sidebar.number_input("Take Profit (pips)", value=30.0, step=1.0)
+sl_pips = st.sidebar.number_input("Stop Loss (pips)", value=25.0, step=1.0)
 multiplier = st.sidebar.number_input("Mnożnik progresji", value=2.0, step=0.5)
 
 st.sidebar.markdown("---")
@@ -117,6 +116,7 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
     
     pos_counter = 2
     stop_out_occurred = False
+    max_lot_used = base_lot
     
     for idx, row in df.iterrows():
         bid = row['Bid']
@@ -124,6 +124,9 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
         timestamp = row['Timestamp']
         
         total_open_lots = sum(p['lot'] for p in positions)
+        if total_open_lots > max_lot_used:
+            max_lot_used = total_open_lots
+            
         required_margin = total_open_lots * margin_per_lot_val
         
         if balance <= required_margin * 0.2:
@@ -228,7 +231,7 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
                         pos_counter += 1
                         positions.append({'id': pos_counter, 'type': 'BUY', 'lot': next_buy_lot, 'open': ask, 'tp': ask + tp_dist, 'sl': ask - sl_dist})
 
-    return pd.DataFrame(trades_history), equity_curve, stop_out_occurred
+    return pd.DataFrame(trades_history), equity_curve, stop_out_occurred, max_lot_used
 
 # --- INTERFEJS GŁÓWNY ---
 if 'file_bytes' in st.session_state:
@@ -243,14 +246,15 @@ if 'file_bytes' in st.session_state:
     if df is not None and len(df) > 0:
         st.success(f"DANE ZAPAMIĘTANE W PAMIĘCI! Plik: **{st.session_state['filename']}** | Ticków: **{len(df):,}**")
         
-        estimated_profit_001 = 25.0 * (pip_value_per_lot * 0.01)
-        dep_001 = margin_per_lot * 0.01
+        # Przelicznik wyświetlany dynamicznie na żywo po zmianie w panelu
+        estimated_profit = tp_pips * (pip_value_per_lot * base_lot)
+        dep_base = margin_per_lot * base_lot
         
-        st.info(f"📊 Parametry cTrader ({selected_pair}): Depozyt 0.01 lota = **${dep_001:.2f}** | Zysk z TP 25 pips = **${estimated_profit_001:.2f}**")
+        st.info(f"📊 **Aktualne ustawienia cTrader ({selected_pair}):** Depozyt ({base_lot:.2f} lot) = **${dep_base:.2f}** | Zysk TP ({tp_pips:.1f} pips) = **${estimated_profit:.2f}** | Spread = **{custom_spread_pips:.1f} pips**")
         
         if st.button("🚀 Uruchom Symulację"):
             with st.spinner("Przetwarzanie danych..."):
-                trades_df, equity_curve, stop_out = run_backtest(
+                trades_df, equity_curve, stop_out, max_lot = run_backtest(
                     df, capital, base_lot, tp_pips, sl_pips, multiplier, pip_value_per_lot, pip_size, margin_per_lot
                 )
             
@@ -266,11 +270,12 @@ if 'file_bytes' in st.session_state:
             tp_count = len(trades_df[trades_df['Reason'] == 'TP']) if not trades_df.empty else 0
             sl_count = len(trades_df[trades_df['Reason'] == 'SL']) if not trades_df.empty else 0
             
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Końcowy Kapitał", f"${final_balance:,.2f}")
             col2.metric("Zysk / Strata", f"${total_profit:,.2f}", f"{roi:.2f}%")
             col3.metric("Liczba TP", tp_count)
             col4.metric("Liczba SL", sl_count)
+            col5.metric("Największa Transakcja", f"{max_lot:.2f} lot")
             
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=equity_curve, mode='lines', name='Equity/Balance', line=dict(color='#00FF7F', width=2)))
