@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Forex Hedging Backtester", layout="wide")
 
 st.title("📈 Forex Hedging Strategy Backtester")
-st.caption("Symulator strategii hedgingowej z progresją na danych tickowych")
+st.caption("Symulator strategii hedgingowej z prawidłową progresją pozycjonowania")
 
 FOREX_PAIRS = [
     "EURUSD", "AUDUSD", "GBPUSD", "USDCAD", "USDJPY", "AUDCAD", 
@@ -43,7 +43,7 @@ multiplier = st.sidebar.number_input("Mnożnik progresji", value=2.0, step=0.5)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📐 Ustawienia Spreadu & Pipsa")
-use_custom_spread = st.sidebar.checkbox("Użyj własnego spreadu z cTrader (np. 0.2 pipsa)", value=False)
+use_custom_spread = st.sidebar.checkbox("Użyj własnego spreadu z cTrader (np. 0.2 pipsa)", value=True)
 custom_spread_pips = st.sidebar.number_input("Własny spread (pips)", value=0.2, step=0.1, format="%.2f")
 
 pip_size = st.sidebar.number_input("Wielkość pipsa", value=default_pip_size, format="%.4f" if is_jpy else "%.5f")
@@ -52,22 +52,18 @@ pip_value_per_lot = st.sidebar.number_input("Wartość 1 pipsa / 1 lot ($)", val
 # --- FUNKCJA PARSUJĄCA PLIKI HISTDATA / CSV ---
 def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
     try:
-        # Odczytujemy pierwsze linie, żeby sprawdzić separator i format
         sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
         uploaded_file.seek(0)
-        
         sep = ';' if ';' in sample else (',' if ',' in sample else '\t')
         
         df = pd.read_csv(uploaded_file, sep=sep, header=None, engine='python')
         
-        # Format HistData ASCII: [DateTime, Bid, Ask, Volume] lub [DateTime, Bid, Ask]
         if len(df.columns) >= 3 and isinstance(df.iloc[0, 1], (int, float, np.number)):
             df = df.rename(columns={0: 'Timestamp', 1: 'Bid', 2: 'Ask'})
         elif len(df.columns) >= 2 and isinstance(df.iloc[0, 1], (int, float, np.number)):
             df = df.rename(columns={0: 'Timestamp', 1: 'Bid'})
             df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
         else:
-            # Re-read z nagłówkami
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, sep=sep, engine='python')
             col_map = {}
@@ -81,7 +77,6 @@ def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
                     col_map[c] = 'Timestamp'
             df = df.rename(columns=col_map)
 
-        # Jeśli zaznaczono własny spread z cTradera
         if use_custom or 'Ask' not in df.columns:
             df['Ask'] = df['Bid'] + (custom_spread_pips * pip_sz)
             
@@ -90,7 +85,7 @@ def parse_tick_file(uploaded_file, custom_spread_pips, use_custom, pip_sz):
         st.error(f"Błąd odczytu danych: {e}")
         return None
 
-# --- SILNIK SYMULACJI ---
+# --- SILNIK SYMULACJI (POPRAWIONA PROGRESJA) ---
 def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pip_val, pip_sz):
     tp_dist = tp_pips * pip_sz
     sl_dist = sl_pips * pip_sz
@@ -99,15 +94,16 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
     equity_curve = [initial_capital]
     trades_history = []
     
-    buy_lots = base_lot
-    sell_lots = base_lot
+    # Stan bieżących lotów dla nowo otwieranych pozycji
+    next_buy_lot = base_lot
+    next_sell_lot = base_lot
     
     current_bid = df['Bid'].iloc[0]
     current_ask = df['Ask'].iloc[0]
     
     positions = [
-        {'type': 'BUY', 'lot': buy_lots, 'open': current_ask, 'tp': current_ask + tp_dist, 'sl': current_ask - sl_dist},
-        {'type': 'SELL', 'lot': sell_lots, 'open': current_bid, 'tp': current_bid - tp_dist, 'sl': current_bid + sl_dist}
+        {'type': 'BUY', 'lot': next_buy_lot, 'open': current_ask, 'tp': current_ask + tp_dist, 'sl': current_ask - sl_dist},
+        {'type': 'SELL', 'lot': next_sell_lot, 'open': current_bid, 'tp': current_bid - tp_dist, 'sl': current_bid + sl_dist}
     ]
     
     for idx, row in df.iterrows():
@@ -160,37 +156,46 @@ def run_backtest(df, initial_capital, base_lot, tp_pips, sl_pips, multiplier, pi
         
         if closed_this_tick:
             equity_curve.append(balance)
-            reasons = [item['reason'] for item in closed_this_tick]
             
+            # PRECYZYJNE WYLICZENIE KOLEJNYCH LOTÓW
             if len(closed_this_tick) == 2:
-                if all(r == 'TP' for r in reasons):
-                    buy_lots = base_lot
-                    sell_lots = base_lot
-                elif all(r == 'SL' for r in reasons):
-                    new_buy_lots = sell_lots * multiplier
-                    new_sell_lots = buy_lots * multiplier
-                    buy_lots = new_buy_lots
-                    sell_lots = new_sell_lots
+                # Obie pozycje zamknięte w tym samym ticku
+                r1, r2 = closed_this_tick[0]['reason'], closed_this_tick[1]['reason']
+                if r1 == 'TP' and r2 == 'TP':
+                    next_buy_lot = base_lot
+                    next_sell_lot = base_lot
+                elif r1 == 'SL' and r2 == 'SL':
+                    # Obie na SL -> Zamiana stron i podwojenie obu
+                    old_buy_lot = next_buy_lot
+                    old_sell_lot = next_sell_lot
+                    next_buy_lot = old_sell_lot * multiplier
+                    next_sell_lot = old_buy_lot * multiplier
             else:
+                # Tylko jedna pozycja się zamknęła
                 item = closed_this_tick[0]
                 p_type = item['pos']['type']
                 reason = item['reason']
                 closed_lot = item['pos']['lot']
                 
-                if p_type == 'BUY':
-                    if reason == 'TP':
-                        buy_lots = base_lot
+                if reason == 'TP':
+                    # Jeśli dana strona wygrała -> resetuje się do bazowej
+                    if p_type == 'BUY':
+                        next_buy_lot = base_lot
                     else:
-                        sell_lots += closed_lot * multiplier
-                elif p_type == 'SELL':
-                    if reason == 'TP':
-                        sell_lots = base_lot
+                        next_sell_lot = base_lot
+                elif reason == 'SL':
+                    # Jeśli dana strona przegrała -> podwajamy i prężymy na PRZECIWNĄ stronę
+                    if p_type == 'BUY':
+                        next_sell_lot = closed_lot * multiplier
+                        next_buy_lot = base_lot  # strona Buy po TP otworzy się normalnie z bazowej
                     else:
-                        buy_lots += closed_lot * multiplier
+                        next_buy_lot = closed_lot * multiplier
+                        next_sell_lot = base_lot # strona Sell po TP otworzy się normalnie z bazowej
 
+            # Otwieramy nowe pozycje z prawidłowo wyliczonymi lotami
             positions = [
-                {'type': 'BUY', 'lot': buy_lots, 'open': ask, 'tp': ask + tp_dist, 'sl': ask - sl_dist},
-                {'type': 'SELL', 'lot': sell_lots, 'open': bid, 'tp': bid - tp_dist, 'sl': bid + sl_dist}
+                {'type': 'BUY', 'lot': next_buy_lot, 'open': ask, 'tp': ask + tp_dist, 'sl': ask - sl_dist},
+                {'type': 'SELL', 'lot': next_sell_lot, 'open': bid, 'tp': bid - tp_dist, 'sl': bid + sl_dist}
             ]
 
     return pd.DataFrame(trades_history), equity_curve
@@ -202,12 +207,8 @@ if uploaded_file is not None:
     if df is not None and len(df) > 0:
         st.success(f"Plik załadowany! Para: **{selected_pair}** | Załadowanych ticków: **{len(df):,}**")
         
-        # Wyliczenie aktualnego spreadu z pliku
         sample_spread = (df['Ask'].iloc[0] - df['Bid'].iloc[0]) / pip_size
-        st.info(f"💡 Aktualny spread w teście: **{sample_spread:.2f} pipsa** (Bid: {df['Bid'].iloc[0]}, Ask: {df['Ask'].iloc[0]})")
-        
-        st.write("Podgląd pierwszych 3 wierszy:")
-        st.dataframe(df.head(3), use_container_width=True)
+        st.info(f"💡 Ustawiony spread: **{sample_spread:.2f} pipsa** (Bid: {df['Bid'].iloc[0]}, Ask: {df['Ask'].iloc[0]})")
         
         if st.button("🚀 Uruchom Symulację"):
             with st.spinner("Przetwarzanie danych tickowych..."):
